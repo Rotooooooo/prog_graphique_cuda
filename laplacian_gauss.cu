@@ -1,0 +1,193 @@
+#include <opencv2/opencv.hpp>
+#include <vector>
+#include <cstring>
+
+/**
+ * Kernel pour transformer l'image RGB en niveaux de gris.
+ */
+__global__ void grayscale( unsigned char * rgb, unsigned char * tab, std::size_t cols, std::size_t rows ) {
+  auto i = blockIdx.x * blockDim.x + threadIdx.x;
+  auto j = blockIdx.y * blockDim.y + threadIdx.y;
+  if( i < cols && j < rows ) {
+    tab[ j * cols + i ] = (
+			 307 * rgb[ 3 * ( j * cols + i ) ]
+			 + 604 * rgb[ 3 * ( j * cols + i ) + 1 ]
+			 + 113 * rgb[  3 * ( j * cols + i ) + 2 ]
+			 ) >> 10;
+  }
+}
+/**
+ * Kernel pour obtenir les contours à partir de l'image en niveaux de gris.
+ */
+__global__ void laplacian( unsigned char * tab, unsigned char * tab_res, std::size_t cols, std::size_t rows )
+{
+  auto i = blockIdx.x * blockDim.x + threadIdx.x;
+  auto j = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if( i > 1 && i < cols && j > 1 && j < rows )
+  {
+   auto res = 
+           -     tab[ (j-1)*cols + i - 1 ] - 2* tab[ (j-1)*cols + i ] -   tab[ (j-1)*cols + i + 1 ]
+           - 2 * tab[ (j  )*cols + i - 1 ] + 16*tab[ (j  )*cols + i ] - 2*tab[ (j  )*cols + i + 1 ]
+           -     tab[ (j+1)*cols + i - 1 ] - 2* tab[ (j+1)*cols + i ] -   tab[ (j+1)*cols + i + 1 ]
+           -     tab[ (j-2)*cols + i     ] -    tab[ (j  )*cols + i - 2 ] - tab[ (j+2)*cols + i] - tab[ (j)*cols + i + 2 ];
+
+    res = res > 255 ? 255 : res;
+    res = res < 0 ? 0 : res;
+    tab_res[ j * cols + i ] = res;
+  }
+}
+/**
+ * Kernel pour obtenir les contours à partir de l'image en niveaux de gris, en utilisant la mémoire shared
+ * pour limiter les accès à la mémoire globale.
+ */
+ __global__ void laplacian_shared( unsigned char * tab, unsigned char * tab_res, std::size_t cols, std::size_t rows )
+ {
+   auto li = threadIdx.x;
+   auto lj = threadIdx.y;
+ 
+   auto w = blockDim.x;
+   auto h = blockDim.y;
+ 
+   auto i = blockIdx.x * (blockDim.x-5) + threadIdx.x;
+   auto j = blockIdx.y * (blockDim.y-5) + threadIdx.y;
+ 
+   extern __shared__ unsigned char shared_tab[];
+ 
+   if( i < cols && j < rows )
+   {
+     shared_tab[ lj * w + li ] = tab[ j * cols + i ];
+   }
+ 
+   __syncthreads();
+ 
+   if( i < cols -2 && j < rows-2 && li > 2 && li < (w-2) && lj > 2 && lj < (h-2) )
+   {
+   auto res = 
+           -     shared_tab[ (lj-1)*w + li - 1 ] - 2* shared_tab[ (lj-1)*w + li ] -   shared_tab[ (lj-1)*w + li + 1 ]
+           - 2 * shared_tab[ (lj  )*w + li - 1 ] + 16*shared_tab[ (lj  )*w + li ] - 2*shared_tab[ (lj  )*w + li + 1 ]
+           -     shared_tab[ (lj+1)*w + li - 1 ] - 2* shared_tab[ (lj+1)*w + li ] -   shared_tab[ (lj+1)*w + li + 1 ]
+           -     shared_tab[ (lj-2)*w + li     ] -    shared_tab[ (lj  )*w + li - 2 ] - shared_tab[ (lj+2)*w + li] - shared_tab[ (lj)*w + li + 2 ];
+
+    res = res > 255 ? 255 : res;
+    res = res < 0 ? 0 : res;
+    tab_res[ j * cols + i ] = res;
+   }
+ }
+/**
+ * Kernel fusionnant le passage en niveaux de gris et la détection de contours.
+ */
+ __global__ void grayscale_laplacian_shared( unsigned char * rgb, unsigned char * tab_res, std::size_t cols, std::size_t rows ) {
+  auto i = blockIdx.x * (blockDim.x-5) + threadIdx.x;
+  auto j = blockIdx.y * (blockDim.y-5) + threadIdx.y;
+
+  auto li = threadIdx.x;
+  auto lj = threadIdx.y;
+
+  auto w = blockDim.x;
+  auto h = blockDim.y;
+
+  extern __shared__ unsigned char shared_tab[];
+
+  if( i < cols && j < rows ) {
+    shared_tab[ lj * w + li ] = (
+			 307 * rgb[ 3 * ( j * cols + i ) ]
+			 + 604 * rgb[ 3 * ( j * cols + i ) + 1 ]
+			 + 113 * rgb[  3 * ( j * cols + i ) + 2 ]
+			 ) >> 10;
+  }
+
+  __syncthreads();
+
+  if( i < cols -2 && j < rows-2 && li > 2 && li < (w-2) && lj > 2 && lj < (h-2) )
+  {
+    auto res = 
+           -     shared_tab[ (lj-1)*w + li - 1 ] - 2* shared_tab[ (lj-1)*w + li ] -   shared_tab[ (lj-1)*w + li + 1 ]
+           - 2 * shared_tab[ (lj  )*w + li - 1 ] + 16*shared_tab[ (lj  )*w + li ] - 2*shared_tab[ (lj  )*w + li + 1 ]
+           -     shared_tab[ (lj+1)*w + li - 1 ] - 2* shared_tab[ (lj+1)*w + li ] -   shared_tab[ (lj+1)*w + li + 1 ]
+           -     shared_tab[ (lj-2)*w + li     ] -    shared_tab[ (lj  )*w + li - 2 ] - shared_tab[ (lj+2)*w + li] - shared_tab[ (lj)*w + li + 2 ];
+
+    res = res > 255 ? 255 : res;
+    res = res < 0 ? 0 : res;
+    tab_res[ j * cols + i ] = res;
+  }
+}
+
+
+int main()
+{
+  cv::Mat m_in = cv::imread("in.jpg", cv::IMREAD_UNCHANGED );
+
+  auto rows = m_in.rows;
+  auto cols = m_in.cols;
+
+  unsigned char * tab = nullptr;
+  cudaMallocHost( &tab, rows * cols );
+  cv::Mat m_out( rows, cols, CV_8UC1, tab );
+
+  unsigned char * rgb = nullptr;
+  cudaMallocHost( &rgb, 3 * rows * cols );
+  
+  std::memcpy( rgb, m_in.data, 3 * rows * cols );
+
+  unsigned char * rgb_d;
+  unsigned char * tab_d;
+  unsigned char * s_d;
+
+  cudaMalloc( &rgb_d, 3 * rows * cols );
+  cudaMalloc( &tab_d, rows * cols );
+  cudaMalloc( &s_d, rows * cols );
+
+  cudaMemcpy( rgb_d, rgb, 3 * rows * cols, cudaMemcpyHostToDevice );
+
+  dim3 block( 64, 8 );
+  dim3 grid0( ( cols - 1) / block.x + 1 , ( rows - 1 ) / block.y + 1 );
+
+  dim3 grid1( ( cols - 2) / (block.x-5) + 1 , ( rows - 2 ) / (block.y-5) + 1 );
+    
+  cudaEvent_t start, stop;
+
+  cudaEventCreate( &start );
+  cudaEventCreate( &stop );
+
+  // Mesure du temps de calcul du kernel
+  cudaEventRecord( start );
+
+    
+  // Version en 2 étapes.
+//  grayscale<<< grid0, block >>>( rgb_d, tab_d, cols, rows );
+ // laplacian<<< grid0, block >>>( tab_d, s_d, cols, rows );
+  
+
+  /*
+  // Version en 2 étapes, Sobel avec mémoire shared.
+  grayscale<<< grid0, block >>>( rgb_d, tab_d, cols, rows );
+  laplacian_shared<<< grid1, block, block.x * block.y >>>( tab_d, s_d, cols, rows );
+  */
+
+  // Version fusionnée.
+  grayscale_laplacian_shared<<< grid1, block, block.x * block.y >>>( rgb_d, s_d, cols, rows );
+
+  cudaEventRecord( stop );
+  
+  cudaMemcpy( tab, s_d, rows * cols, cudaMemcpyDeviceToHost );
+
+  cudaEventSynchronize( stop );
+  float duration;
+  cudaEventElapsedTime( &duration, start, stop );
+  std::cout << "time=" << duration << std::endl;
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+
+  cv::imwrite( "in_laplacian_gauss.jpg", m_out );
+
+  cudaFree( rgb_d);
+  cudaFree( tab_d);
+  cudaFree( s_d);
+
+  cudaFreeHost( tab );
+  cudaFreeHost( rgb );
+  
+  return 0;
+}
